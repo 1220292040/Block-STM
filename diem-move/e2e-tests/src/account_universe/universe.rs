@@ -104,6 +104,12 @@ impl AccountUniverseGen {
         AccountUniverse::new(self.accounts, self.pick_style, false)
     }
 
+    pub fn gen_account_universe(&self) -> AccountUniverse {
+        let acc_clone = self.accounts.clone();
+        let pick_clone = self.pick_style.clone();
+        AccountUniverse::new(acc_clone, pick_clone, false)
+    }
+
     /// Returns an [`AccountUniverse`] with the initial state generated in this universe, and
     /// configures the universe to run tests in gas-cost-stability mode.
     ///
@@ -148,6 +154,10 @@ impl AccountUniverse {
     /// will include those new accounts.
     pub fn accounts(&self) -> &[AccountCurrent] {
         &self.accounts
+    }
+
+    pub fn get_account(&self, index:usize)-> &AccountCurrent{
+        &self.accounts[index]
     }
 
     /// Adds an account to the universe so that future transactions can be made out of this account.

@@ -5,15 +5,15 @@ use criterion::{measurement::Measurement, BatchSize, Bencher};
 use diem_types::transaction::{SignedTransaction, Transaction};
 use diem_vm::parallel_executor::ParallelDiemVM;
 use language_e2e_tests::{
-    account_universe::{log_balance_strategy, AUTransactionGen, AccountUniverseGen},
-    executor::FakeExecutor,
-    gas_costs::TXN_RESERVED,
+    account_universe::{log_balance_strategy, AUTransactionGen, AccountUniverseGen}, common_transactions::peer_to_peer_txn, executor::FakeExecutor, gas_costs::TXN_RESERVED
 };
 use proptest::{
-    collection::vec,
-    strategy::{Strategy, ValueTree},
-    test_runner::TestRunner,
+    collection::vec, strategy::{Just, Strategy, ValueTree}, test_runner::TestRunner
 };
+use std::time::Instant;
+use crate::utils;
+use std::collections::HashMap;
+
 
 /// Benchmarking support for transactions.
 #[derive(Clone, Debug)]
@@ -21,6 +21,38 @@ pub struct TransactionBencher<S> {
     num_accounts: usize,
     num_transactions: usize,
     strategy: S,
+}
+
+impl TransactionBencher<()> {
+    pub fn new_default() -> Self {
+        Self {
+            num_accounts: 0,
+            num_transactions: 0,
+            strategy: (),
+        }
+    }
+
+     /// Runs the bencher.
+     pub fn replay_parallel(
+        &self,
+        num_accounts: usize,
+        file_path: &str,
+        num_warmups: usize,
+        num_runs: usize,
+    ) -> Vec<usize>{
+        let mut ret = Vec::new();
+        let total_runs = num_warmups + num_runs;
+        for i in 0..total_runs {
+            let state = ParallelBenchState::setup_from_files_and_universe(file_path, universe_strategy_with_enough_balance(num_accounts));
+            if i < num_warmups {
+                println!("WARMUP - ignore results");
+                state.execute();
+            } else {
+                ret.push(state.execute());
+            }
+        }
+        ret
+    }
 }
 
 impl<S> TransactionBencher<S>
@@ -104,7 +136,6 @@ where
                 num_accounts,
                 num_txn,
             );
-
             if i < num_warmups {
                 println!("WARMUP - ignore results");
                 state.execute();
@@ -124,8 +155,7 @@ where
         ret
     }
 }
-
-struct TransactionBenchState {
+pub struct TransactionBenchState {
     // Use the fake executor for now.
     // TODO: Hook up the real executor in the future. Here's what needs to be done:
     // 1. Provide a way to construct a write set from the genesis write set + initial balances.
@@ -191,7 +221,53 @@ impl TransactionBenchState {
             transactions,
         }
     }
+    
+    fn setup_from_files_and_universe(file_path: &str,universe_strategy: impl Strategy<Value = AccountUniverseGen>)->Self{
+        let mut seq_map: HashMap<usize, usize> = HashMap::new();
 
+        let mut runner = TestRunner::default();
+        let mut executor = FakeExecutor::from_genesis_file();
+        let mut transactions:Vec<SignedTransaction> = Vec::new();
+        let universe = universe_strategy
+            .new_tree(&mut runner)
+            .expect("creating a new value should succeed")
+            .current();
+        let universe = universe.setup_gas_cost_stability(&mut executor);
+        //construct transaction
+        let result = utils::read_csv_with_header(file_path);
+        match result {
+            Ok(data) => {
+                for tuple in &data{
+                    let sender = universe.get_account(tuple.0);
+                    let receiver = universe.get_account(tuple.1);
+
+                    let entry = seq_map.entry(tuple.0);
+                    match entry {
+                        std::collections::hash_map::Entry::Occupied(mut occupied)=>{
+                            *occupied.get_mut()+=1;
+                        }
+                        std::collections::hash_map::Entry::Vacant(vacant) => {
+                            vacant.insert(sender.sequence_number() as usize);
+                        }
+                    };
+                    let txn = peer_to_peer_txn(
+                        sender.account(), 
+                        receiver.account(), 
+                        seq_map[&tuple.0] as u64, 
+                        1,
+                    );
+                    transactions.push(txn);   
+                }
+            },
+            Err(err) =>{
+                eprintln!("Error: {:?}", err);
+            }
+        }
+        Self{
+            executor,
+            transactions,
+        }
+    }
     /// Executes this state in a single block.
     fn execute(self) {
         // The output is ignored here since we're just testing transaction performance, not trying
@@ -199,6 +275,19 @@ impl TransactionBenchState {
         self.executor
             .execute_block(self.transactions)
             .expect("VM should not fail to start");
+    }
+
+    /// Executes this state in a single block for tps calc.
+    fn execute_block_sequential_tps(self) -> usize {
+        let transaction_size = self.transactions.len();
+        let timer = Instant::now();
+        let useless = self.executor.execute_block_and_keep_vm_status(
+            self.transactions,
+        );
+        let exec_t = timer.elapsed();
+        drop(useless);
+
+        (transaction_size * 1000 / exec_t.as_millis() as usize) as usize    
     }
 }
 
@@ -210,6 +299,15 @@ fn universe_strategy(
     // Multiply by 5 past the number of  to provide
     let max_balance = TXN_RESERVED * num_transactions as u64 * 5;
     let balance_strategy = log_balance_strategy(max_balance);
+    AccountUniverseGen::strategy(num_accounts, balance_strategy)
+}
+
+pub fn universe_strategy_with_enough_balance(
+    num_accounts: usize,
+) -> impl Strategy<Value = AccountUniverseGen> {
+    // provide max_balance(10^9) for every accounts
+    let max_balance = 1_000_000_000;
+    let balance_strategy = Just(max_balance);
     AccountUniverseGen::strategy(num_accounts, balance_strategy)
 }
 
@@ -237,6 +335,12 @@ impl ParallelBenchState {
         }
     }
 
+    fn setup_from_files_and_universe(file_path: &str,universe_strategy: impl Strategy<Value = AccountUniverseGen>) -> Self{
+        Self {
+            bench_state: TransactionBenchState::setup_from_files_and_universe(file_path,universe_strategy),
+        }
+    }
+
     fn execute(self) -> usize {
         let txns = self
             .bench_state
@@ -246,7 +350,6 @@ impl ParallelBenchState {
             .collect();
         let state_view = self.bench_state.executor.get_state_view();
         // measured - microseconds.
-
         ParallelDiemVM::execute_block_tps(
             txns,
             state_view,
